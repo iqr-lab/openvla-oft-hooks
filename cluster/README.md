@@ -2,19 +2,18 @@
 
 This builds an environment-only Apptainer image. The repo is not copied into
 the `.sif`; bind the repo at runtime so hook edits do not require rebuilding.
+The definition file is self-contained, so it can be launched from any directory.
 
 ## Build
 
-From the repo root:
-
 ```bash
-apptainer build --fakeroot openvla-oft-env.sif cluster/openvla-oft.def
+apptainer build --fakeroot /path/to/openvla-oft-env.sif /path/to/openvla-oft-hooks/cluster/openvla-oft.def
 ```
 
 If fakeroot is unavailable but sudo is available:
 
 ```bash
-sudo apptainer build openvla-oft-env.sif cluster/openvla-oft.def
+sudo apptainer build /path/to/openvla-oft-env.sif /path/to/openvla-oft-hooks/cluster/openvla-oft.def
 ```
 
 ## Test
