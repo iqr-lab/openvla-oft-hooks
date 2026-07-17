@@ -82,6 +82,9 @@ EOF
 
     . /opt/conda/etc/profile.d/conda.sh
     conda env create -f /tmp/openvla-oft-environment.yml
+    /opt/conda/envs/openvla-oft/bin/pip install --no-deps --force-reinstall \
+        protobuf==3.20.3 \
+        tensorflow-metadata==1.14.0
     conda clean -afy
 
     mkdir -p /.venv/bin
