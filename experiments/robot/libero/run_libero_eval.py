@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import sys
+import time
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
@@ -120,6 +121,9 @@ class GenerateConfig:
     #################################################################################################################
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     local_log_dir: str = "./experiments/logs"        # Local directory for eval logs
+    hook_config: Optional[str] = None                # Optional YAML config enabling OpenVLA hook capture
+    hook_output_dir: str = "./experiments/logs/hooks" # Root directory for hook .npy records
+    save_hook_records: bool = True                   # Whether to persist enabled hook records
 
     use_wandb: bool = False                          # Whether to also log results in Weights & Biases
     wandb_entity: str = "your-wandb-entity"          # Name of WandB entity
@@ -216,6 +220,43 @@ def setup_logging(cfg: GenerateConfig):
     return log_file, local_log_filepath, run_id
 
 
+def setup_hooks(cfg: GenerateConfig, run_id: str, log_file=None):
+    """Configure optional OpenVLA hook capture."""
+    if cfg.hook_config is None:
+        try:
+            from experiments.robot.openvla_hooks.hook_runner import set_enabled_hooks, set_hook_config
+
+            set_enabled_hooks([])
+            set_hook_config({})
+        except ImportError:
+            pass
+        return None, [], {}
+
+    from experiments.robot.openvla_hooks.hook_runner import set_enabled_hooks, set_hook_config
+    from experiments.robot.openvla_hooks.io import HookRecordWriter, load_hook_config
+
+    hook_cfg = load_hook_config(cfg.hook_config)
+    hooks_cfg = hook_cfg.get("hooks", {})
+    enabled_hooks = hooks_cfg.get("enabled", [])
+    set_enabled_hooks(enabled_hooks)
+    set_hook_config(hooks_cfg)
+
+    writer = None
+    if cfg.save_hook_records:
+        output_dir = os.path.join(cfg.hook_output_dir, run_id)
+        writer = HookRecordWriter(
+            output_dir,
+            cfg.hook_config,
+            hook_cfg,
+            policy_tag=cfg.model_family,
+            checkpoint=str(cfg.pretrained_checkpoint),
+        )
+        log_message(f"Saving OpenVLA hook records to: {output_dir}", log_file)
+
+    log_message(f"Enabled OpenVLA hooks: {enabled_hooks}", log_file)
+    return writer, enabled_hooks, hooks_cfg
+
+
 def log_message(message: str, log_file=None):
     """Log a message to console and optionally to a log file."""
     logger.info(message)
@@ -286,6 +327,11 @@ def run_episode(
     proprio_projector=None,
     noisy_action_projector=None,
     initial_state=None,
+    task_id=None,
+    episode_idx=None,
+    hook_writer=None,
+    enabled_hooks=None,
+    hook_cfg=None,
     log_file=None,
 ):
     """Run a single episode in the environment."""
@@ -312,6 +358,8 @@ def run_episode(
 
     # Run episode
     success = False
+    query_idx = 0
+    hook_record_paths = []
     try:
         while t < max_steps + cfg.num_steps_wait:
             # Do nothing for the first few timesteps to let objects stabilize
@@ -326,7 +374,31 @@ def run_episode(
 
             # If action queue is empty, requery model
             if len(action_queue) == 0:
+                record_inputs = {
+                    "full_image": observation["full_image"].copy(),
+                    "state": observation["state"].copy(),
+                    "prompt": task_description,
+                }
+                if "wrist_image" in observation:
+                    record_inputs["wrist_image"] = observation["wrist_image"].copy()
+                hook_context = None
+                if enabled_hooks:
+                    hook_context = {
+                        "enabled": True,
+                        "enabled_hooks": enabled_hooks,
+                        "hook_config": hook_cfg or {},
+                        "metadata": {
+                            "task_id": task_id,
+                            "episode_idx": episode_idx,
+                            "query_idx": query_idx,
+                            "timestep": t,
+                            "task_description": task_description,
+                            "success": None,
+                        },
+                    }
+
                 # Query model to get action
+                query_start_time = time.monotonic()
                 actions = get_action(
                     cfg,
                     model,
@@ -337,7 +409,26 @@ def run_episode(
                     proprio_projector=proprio_projector,
                     noisy_action_projector=noisy_action_projector,
                     use_film=cfg.use_film,
+                    hook_context=hook_context,
                 )
+                infer_ms = (time.monotonic() - query_start_time) * 1000
+                if hook_context is not None and hook_writer is not None and hook_context.get("records"):
+                    record_outputs = {
+                        "state": record_inputs["state"],
+                        "actions": np.asarray(actions),
+                        "policy_timing": {
+                            "infer_ms": infer_ms,
+                        },
+                    }
+                    record_path = hook_writer.save_query(
+                        inputs=record_inputs,
+                        outputs=record_outputs,
+                        hook_records=hook_context["records"],
+                        metadata=hook_context["metadata"],
+                    )
+                    hook_record_paths.append(record_path)
+                    log_message(f"Saved OpenVLA hook record: {record_path}", log_file)
+                query_idx += 1
                 action_queue.extend(actions)
 
             # Get action from queue
@@ -356,6 +447,10 @@ def run_episode(
     except Exception as e:
         log_message(f"Episode error: {e}", log_file)
 
+    if hook_writer is not None:
+        for record_path in hook_record_paths:
+            hook_writer.update_query_metadata(record_path, {"success": success})
+
     return success, replay_images
 
 
@@ -369,6 +464,9 @@ def run_task(
     action_head=None,
     proprio_projector=None,
     noisy_action_projector=None,
+    hook_writer=None,
+    enabled_hooks=None,
+    hook_cfg=None,
     total_episodes=0,
     total_successes=0,
     log_file=None,
@@ -419,6 +517,11 @@ def run_task(
             proprio_projector,
             noisy_action_projector,
             initial_state,
+            task_id,
+            episode_idx,
+            hook_writer,
+            enabled_hooks,
+            hook_cfg,
             log_file,
         )
 
@@ -476,6 +579,9 @@ def eval_libero(cfg: GenerateConfig) -> float:
     # Setup logging
     log_file, local_log_filepath, run_id = setup_logging(cfg)
 
+    # Configure optional OpenVLA hook capture
+    hook_writer, enabled_hooks, hook_cfg = setup_hooks(cfg, run_id, log_file)
+
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[cfg.task_suite_name]()
@@ -496,6 +602,9 @@ def eval_libero(cfg: GenerateConfig) -> float:
             action_head,
             proprio_projector,
             noisy_action_projector,
+            hook_writer,
+            enabled_hooks,
+            hook_cfg,
             total_episodes,
             total_successes,
             log_file,

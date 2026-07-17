@@ -1,5 +1,6 @@
 """Utils for evaluating robot policies in various environments."""
 
+import contextlib
 import os
 import random
 import time
@@ -106,6 +107,7 @@ def get_action(
     proprio_projector: Optional[torch.nn.Module] = None,
     noisy_action_projector: Optional[torch.nn.Module] = None,
     use_film: bool = False,
+    hook_context: Optional[Dict[str, Any]] = None,
 ) -> Union[List[np.ndarray], np.ndarray]:
     """
     Query the model to get action predictions.
@@ -127,7 +129,14 @@ def get_action(
     Raises:
         ValueError: If model family is not supported
     """
-    with torch.no_grad():
+    needs_grad = bool(
+        hook_context
+        and hook_context.get("enabled")
+        and "prefix_gradients" in hook_context.get("enabled_hooks", [])
+    )
+    grad_context = contextlib.nullcontext() if needs_grad else torch.no_grad()
+
+    with grad_context:
         if cfg.model_family == "openvla":
             action = get_vla_action(
                 cfg=cfg,
@@ -139,6 +148,7 @@ def get_action(
                 proprio_projector=proprio_projector,
                 noisy_action_projector=noisy_action_projector,
                 use_film=use_film,
+                hook_context=hook_context,
             )
         else:
             raise ValueError(f"Unsupported model family: {cfg.model_family}")

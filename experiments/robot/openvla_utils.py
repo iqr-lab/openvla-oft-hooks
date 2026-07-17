@@ -1,5 +1,6 @@
 """Utils for evaluating OpenVLA or fine-tuned OpenVLA policies."""
 
+import contextlib
 import filecmp
 import json
 import os
@@ -722,6 +723,7 @@ def get_vla_action(
     proprio_projector: Optional[torch.nn.Module] = None,
     noisy_action_projector: Optional[torch.nn.Module] = None,
     use_film: bool = False,
+    hook_context: Optional[Dict[str, Any]] = None,
 ) -> List[np.ndarray]:
     """
     Generate action predictions with the VLA policy.
@@ -740,7 +742,11 @@ def get_vla_action(
     Returns:
         List[np.ndarray]: Predicted actions
     """
-    with torch.inference_mode():
+    hooks_enabled = bool(hook_context and hook_context.get("enabled"))
+    needs_grad = hooks_enabled and "prefix_gradients" in hook_context.get("enabled_hooks", [])
+    inference_context = contextlib.nullcontext() if needs_grad else torch.inference_mode()
+
+    with inference_context:
 
         # Collect all input images
         all_images = [obs["full_image"]]
@@ -771,16 +777,39 @@ def get_vla_action(
 
         # Process proprioception data if used
         proprio = None
+        raw_proprio = None
         if cfg.use_proprio:
-            proprio = obs["state"]
+            raw_proprio = obs["state"].copy()
+            proprio = raw_proprio
             proprio_norm_stats = vla.norm_stats[cfg.unnorm_key]["proprio"]
             obs["state"] = normalize_proprio(proprio, proprio_norm_stats)
             proprio = obs["state"]
 
+        if hooks_enabled:
+            hook_context["observation_input"] = {
+                "images": {
+                    "full": obs["full_image"],
+                    **({"wrist": obs["wrist_image"]} if "wrist_image" in obs else {}),
+                },
+                "state": {
+                    "raw": raw_proprio,
+                    "normalized": proprio,
+                },
+                "prompt": prompt,
+                "task_label": task_label,
+                "center_crop": cfg.center_crop,
+                "num_images_in_input": cfg.num_images_in_input,
+            }
+
         # Generate action
         if action_head is None:
             # Standard VLA output (single-image inputs, discrete actions)
-            action, _ = vla.predict_action(**inputs, unnorm_key=cfg.unnorm_key, do_sample=False)
+            action, _ = vla.predict_action(
+                **inputs,
+                unnorm_key=cfg.unnorm_key,
+                do_sample=False,
+                hook_context=hook_context,
+            )
         else:
             # Custom action head for continuous actions
             action, _ = vla.predict_action(
@@ -792,6 +821,15 @@ def get_vla_action(
                 noisy_action_projector=noisy_action_projector,
                 action_head=action_head,
                 use_film=use_film,
+                hook_context=hook_context,
+            )
+
+        if hooks_enabled and hook_context.get("payload") is not None:
+            from experiments.robot.openvla_hooks.runtime import collect_hook_records
+
+            hook_context["records"] = collect_hook_records(
+                payload=hook_context["payload"],
+                metadata=hook_context.get("metadata", {}),
             )
 
     # Return action chunk as list of actions

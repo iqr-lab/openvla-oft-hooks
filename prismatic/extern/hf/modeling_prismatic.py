@@ -6,6 +6,7 @@ Inherits from the default `transformers.PretrainedModel`. Meant to be standalone
 but exactly replicate the logic in `prismatic.models.vlms.prismatic.py`.
 """
 
+import contextlib
 import logging
 from dataclasses import dataclass
 from functools import partial
@@ -39,6 +40,17 @@ from .configuration_prismatic import OpenVLAConfig, PrismaticConfig
 
 # Set up logger
 logger = logging.getLogger(__name__)
+
+OPENVLA_HOOK_NAMES = (
+    "observation_input",
+    "token_spans",
+    "prefix_embeddings",
+    "prefix_final_hidden_state",
+    "prefix_gradients",
+    "action_chunks",
+    "raw_attention_weights",
+    "value_vectors",
+)
 
 
 # === Utility Functions for Monkey-Patching ===
@@ -483,6 +495,287 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
 
         return multimodal_embeddings, multimodal_attention_mask
 
+    def _get_decoder_layers(self):
+        """Best-effort access to HF decoder layers across LLaMA/Mistral-style wrappers."""
+        candidates = [
+            ("model", "layers"),
+            ("base_model", "model", "layers"),
+            ("language_model", "model", "layers"),
+        ]
+        for path in candidates:
+            module = self.language_model
+            for attr in path:
+                module = getattr(module, attr, None)
+                if module is None:
+                    break
+            if module is not None:
+                return module
+        return None
+
+    def _parse_hook_layers(self, hook_context, hook_name, num_layers):
+        hook_cfg = (hook_context or {}).get("hook_config", {}).get(hook_name, {})
+        selected_layers = hook_cfg.get("layers", None)
+        if selected_layers is None or selected_layers == "all":
+            return list(range(num_layers))
+        return [int(layer_idx) for layer_idx in selected_layers]
+
+    def _capture_value_vectors(self, selected_layers):
+        """Register temporary hooks on decoder value projections."""
+        layers = self._get_decoder_layers()
+        if layers is None:
+            return [], {}
+
+        captured = {}
+        handles = []
+
+        for layer_idx in selected_layers:
+            if layer_idx < 0 or layer_idx >= len(layers):
+                continue
+            self_attn = getattr(layers[layer_idx], "self_attn", None)
+            v_proj = getattr(self_attn, "v_proj", None)
+            if v_proj is None:
+                continue
+
+            def save_value_projection(_module, _inputs, output, idx=layer_idx):
+                captured[idx] = output
+
+            handles.append(v_proj.register_forward_hook(save_value_projection))
+
+        return handles, captured
+
+    def _format_value_vectors(self, captured_values, selected_layers, prefix_end):
+        layers = self._get_decoder_layers()
+        if layers is None:
+            return None
+
+        vectors = []
+        kept_layers = []
+        for layer_idx in selected_layers:
+            value = captured_values.get(layer_idx)
+            if value is None:
+                continue
+            self_attn = getattr(layers[layer_idx], "self_attn", None)
+            num_kv_heads = getattr(self_attn, "num_key_value_heads", None)
+            head_dim = getattr(self_attn, "head_dim", None)
+            if num_kv_heads is None or head_dim is None:
+                hidden_size = value.shape[-1]
+                num_kv_heads = getattr(self_attn, "num_heads", 1)
+                head_dim = hidden_size // num_kv_heads
+
+            value = value[:, :prefix_end, :]
+            value = value.reshape(value.shape[0], value.shape[1], num_kv_heads, head_dim)
+            vectors.append(value)
+            kept_layers.append(layer_idx)
+
+        if not vectors:
+            return None
+
+        stacked = torch.stack(vectors, dim=1)
+        return {
+            "vectors": stacked,
+            "layers": torch.tensor(kept_layers, device=stacked.device, dtype=torch.long),
+            "key_end": prefix_end,
+            "num_kv_heads": stacked.shape[3],
+            "head_dim": stacked.shape[4],
+        }
+
+    def _build_token_spans(
+        self,
+        *,
+        NUM_PATCHES,
+        NUM_PROMPT_TOKENS,
+        action_prediction_start,
+        action_prediction_end,
+        prefix_end,
+        use_proprio,
+    ):
+        spans = {}
+        cursor = 0
+
+        spans["bos"] = {"start": cursor, "end": cursor + 1}
+        cursor += 1
+
+        num_images = self.vision_backbone.get_num_images_in_input()
+        patches_per_image = self.vision_backbone.get_num_patches()
+        image_spans = {}
+        image_names = ["full", "wrist"]
+        for image_idx in range(num_images):
+            image_name = image_names[image_idx] if image_idx < len(image_names) else f"image_{image_idx}"
+            image_spans[image_name] = {"start": cursor, "end": cursor + patches_per_image}
+            cursor += patches_per_image
+        spans["image"] = image_spans
+
+        if use_proprio:
+            spans["proprio"] = {"start": cursor, "end": cursor + 1}
+            cursor += 1
+
+        prompt_end = cursor + NUM_PROMPT_TOKENS
+        action_token_start = prompt_end
+        action_token_end = action_token_start + ACTION_DIM * NUM_ACTIONS_CHUNK
+        spans["prompt"] = {"start": cursor, "end": prompt_end}
+        spans["prefix"] = {"start": 0, "end": prefix_end}
+        # OpenVLA-OFT predicts each action token from the previous sequence position after the causal-LM shift.
+        spans["action_prediction_positions"] = {"start": action_prediction_start, "end": action_prediction_end}
+        spans["action_tokens"] = {"start": action_token_start, "end": action_token_end}
+        spans["stop"] = {"start": action_token_end, "end": action_token_end + 1}
+        spans["num_patches"] = NUM_PATCHES
+        spans["num_prompt_tokens"] = NUM_PROMPT_TOKENS
+        spans["causal_prediction_shift"] = 1
+
+        return spans
+
+    def _slice_attention_for_hooks(self, attentions, selected_layers, action_start, action_end, prefix_end):
+        if attentions is None:
+            return None
+
+        weights = []
+        kept_layers = []
+        for layer_idx in selected_layers:
+            if layer_idx < 0 or layer_idx >= len(attentions):
+                continue
+            layer_attn = attentions[layer_idx]
+            if layer_attn is None:
+                continue
+            weights.append(layer_attn[:, :, action_start:action_end, :prefix_end])
+            kept_layers.append(layer_idx)
+
+        if not weights:
+            return None
+
+        stacked = torch.stack(weights, dim=1)
+        return {
+            "weights": stacked,
+            "layers": torch.tensor(kept_layers, device=stacked.device, dtype=torch.long),
+            "key_end": prefix_end,
+            "query_start": action_start,
+            "query_end": action_end,
+            "num_heads": stacked.shape[2],
+            "num_layers": stacked.shape[1],
+        }
+
+    def _compute_prefix_gradients(
+        self,
+        *,
+        multimodal_embeddings,
+        multimodal_attention_mask,
+        prefix_end,
+        action_start,
+        action_end,
+        action_head,
+    ):
+        if action_head is None:
+            return None
+
+        prefix = multimodal_embeddings[:, :prefix_end, :].detach().clone().requires_grad_(True)
+        suffix = multimodal_embeddings[:, prefix_end:, :].detach()
+        grad_embeddings = torch.cat([prefix, suffix], dim=1)
+
+        language_model_output = self.language_model(
+            input_ids=None,
+            attention_mask=multimodal_attention_mask,
+            position_ids=None,
+            past_key_values=None,
+            inputs_embeds=grad_embeddings,
+            labels=None,
+            use_cache=None,
+            output_attentions=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        actions_hidden_states = language_model_output.hidden_states[-1][:, action_start:action_end, :]
+        normalized_actions = action_head.predict_action(actions_hidden_states)
+        score = normalized_actions[:, 0, :].sum()
+        return torch.autograd.grad(score, prefix, retain_graph=False, create_graph=False)[0]
+
+    def _build_hook_payload(
+        self,
+        *,
+        hook_context,
+        inputs,
+        proprio,
+        input_ids,
+        attention_mask,
+        projected_patch_embeddings,
+        multimodal_embeddings,
+        multimodal_attention_mask,
+        language_model_output,
+        actions,
+        NUM_PATCHES,
+        NUM_PROMPT_TOKENS,
+        action_head,
+        use_proprio,
+        value_capture=None,
+    ):
+        if not hook_context or not hook_context.get("enabled"):
+            return None
+
+        enabled = set(hook_context.get("enabled_hooks", []))
+        action_start = NUM_PATCHES + NUM_PROMPT_TOKENS
+        action_end = action_start + ACTION_DIM * NUM_ACTIONS_CHUNK
+        prefix_end = action_start + 1
+
+        observation_input = dict(hook_context.get("observation_input", {}))
+        observation_input.update(
+            {
+                "input_ids": input_ids.detach().cpu(),
+                "attention_mask": attention_mask.detach().cpu(),
+                "pixel_values_shape": tuple(inputs["pixel_values"].shape),
+                "proprio": None if proprio is None else torch.as_tensor(proprio).detach().cpu(),
+            }
+        )
+
+        prefix_embeddings = multimodal_embeddings[:, :prefix_end, :]
+        prefix_final_hidden_state = language_model_output.hidden_states[-1][:, :prefix_end, :]
+        action_tensor = torch.as_tensor(actions, dtype=prefix_embeddings.dtype, device=prefix_embeddings.device)
+        action_tensor = action_tensor.reshape(1, NUM_ACTIONS_CHUNK, ACTION_DIM).unsqueeze(0)
+
+        payload = {
+            "observation_input": observation_input,
+            "token_spans": self._build_token_spans(
+                NUM_PATCHES=NUM_PATCHES,
+                NUM_PROMPT_TOKENS=NUM_PROMPT_TOKENS,
+                action_prediction_start=action_start,
+                action_prediction_end=action_end,
+                prefix_end=prefix_end,
+                use_proprio=use_proprio,
+            ),
+            "prefix_embeddings": prefix_embeddings,
+            "prefix_final_hidden_state": prefix_final_hidden_state,
+            "action_chunks": {
+                "chunks": action_tensor,
+                "noises": None,
+            },
+        }
+
+        if "raw_attention_weights" in enabled:
+            selected_layers = self._parse_hook_layers(
+                hook_context, "raw_attention_weights", len(language_model_output.attentions or [])
+            )
+            payload["raw_attention_weights"] = self._slice_attention_for_hooks(
+                language_model_output.attentions,
+                selected_layers,
+                action_start,
+                action_end,
+                prefix_end,
+            )
+
+        if "value_vectors" in enabled and value_capture is not None:
+            selected_layers, captured_values = value_capture
+            payload["value_vectors"] = self._format_value_vectors(captured_values, selected_layers, prefix_end)
+
+        if "prefix_gradients" in enabled:
+            payload["prefix_gradients"] = self._compute_prefix_gradients(
+                multimodal_embeddings=multimodal_embeddings,
+                multimodal_attention_mask=multimodal_attention_mask,
+                prefix_end=prefix_end,
+                action_start=action_start,
+                action_end=action_end,
+                action_head=action_head,
+            )
+
+        hook_context["payload"] = payload
+        return payload
+
     def _build_multimodal_labels(self, labels, projected_patch_embeddings):
         """Build multimodal labels with IGNORE_INDEX for patch embeddings"""
         if labels is not None:
@@ -884,6 +1177,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         NUM_PATCHES,
         NUM_PROMPT_TOKENS,
         action_head=None,
+        hook_context=None,
     ):
         """Run L1 regression-based continuous action prediction or discrete action tokens prediction."""
         # Zero out action token embeddings
@@ -895,19 +1189,38 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             input_embeddings, projected_patch_embeddings, attention_mask
         )
 
+        hook_enabled = bool(hook_context and hook_context.get("enabled"))
+        enabled_hooks = set((hook_context or {}).get("enabled_hooks", []))
+        output_attentions = "raw_attention_weights" in enabled_hooks
+        needs_prefix_gradients = "prefix_gradients" in enabled_hooks
+        value_capture = None
+        value_handles = []
+        if hook_enabled and "value_vectors" in enabled_hooks:
+            layers = self._get_decoder_layers()
+            num_layers = len(layers) if layers is not None else 0
+            selected_layers = self._parse_hook_layers(hook_context, "value_vectors", num_layers)
+            value_handles, captured_values = self._capture_value_vectors(selected_layers)
+            value_capture = (selected_layers, captured_values)
+
         # Forward pass through language model
-        language_model_output = self.language_model(
-            input_ids=None,
-            attention_mask=multimodal_attention_mask,
-            position_ids=None,
-            past_key_values=None,
-            inputs_embeds=multimodal_embeddings,
-            labels=None,
-            use_cache=None,
-            output_attentions=False,
-            output_hidden_states=True,
-            return_dict=True,
-        )
+        try:
+            forward_context = torch.no_grad() if needs_prefix_gradients else contextlib.nullcontext()
+            with forward_context:
+                language_model_output = self.language_model(
+                    input_ids=None,
+                    attention_mask=multimodal_attention_mask,
+                    position_ids=None,
+                    past_key_values=None,
+                    inputs_embeds=multimodal_embeddings,
+                    labels=None,
+                    use_cache=None,
+                    output_attentions=output_attentions,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+        finally:
+            for handle in value_handles:
+                handle.remove()
 
         # Extract hidden states for action tokens
         last_hidden_states = language_model_output.hidden_states[-1]  # (B, seq_len, D)
@@ -939,7 +1252,16 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             normalized_actions = self.bin_centers[discretized_actions]
             normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
 
-        return normalized_actions, actions_hidden_states
+        hook_tensors = None
+        if hook_enabled:
+            hook_tensors = {
+                "multimodal_embeddings": multimodal_embeddings,
+                "multimodal_attention_mask": multimodal_attention_mask,
+                "language_model_output": language_model_output,
+                "value_capture": value_capture,
+            }
+
+        return normalized_actions, actions_hidden_states, hook_tensors
 
     def predict_action(
         self,
@@ -950,6 +1272,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         action_head=None,
         noisy_action_projector=None,
         use_film: bool = False,
+        hook_context=None,
         **kwargs: str,
     ) -> np.ndarray:
         """Predict actions from input sequence, with options for different prediction methods.
@@ -1039,9 +1362,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 NUM_PROMPT_TOKENS,
                 noisy_action_projector,
             )
+            hook_tensors = None
         else:
             # Run regression or discrete token-based prediction
-            normalized_actions, actions_hidden_states = self._regression_or_discrete_prediction(
+            normalized_actions, actions_hidden_states, hook_tensors = self._regression_or_discrete_prediction(
                 input_embeddings,
                 all_actions_mask,
                 projected_patch_embeddings,
@@ -1050,10 +1374,30 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 NUM_PATCHES,
                 NUM_PROMPT_TOKENS,
                 action_head,
+                hook_context=hook_context,
             )
 
         # Unnormalize predicted actions
         actions = self._unnormalize_actions(normalized_actions, unnorm_key)
+
+        if hook_tensors is not None:
+            self._build_hook_payload(
+                hook_context=hook_context,
+                inputs=kwargs,
+                proprio=proprio,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                projected_patch_embeddings=projected_patch_embeddings,
+                multimodal_embeddings=hook_tensors["multimodal_embeddings"],
+                multimodal_attention_mask=hook_tensors["multimodal_attention_mask"],
+                language_model_output=hook_tensors["language_model_output"],
+                actions=actions,
+                NUM_PATCHES=NUM_PATCHES,
+                NUM_PROMPT_TOKENS=NUM_PROMPT_TOKENS,
+                action_head=action_head,
+                use_proprio=use_proprio,
+                value_capture=hook_tensors["value_capture"],
+            )
 
         return actions, actions_hidden_states
 
