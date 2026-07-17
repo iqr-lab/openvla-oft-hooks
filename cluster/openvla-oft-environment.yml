@@ -37,6 +37,7 @@ dependencies:
       - fastapi
       - uvicorn
       - robosuite==1.4.1
+      - mujoco==3.2.3
       - bddl
       - easydict
       - cloudpickle

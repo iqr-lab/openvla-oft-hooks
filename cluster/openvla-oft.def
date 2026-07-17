@@ -73,6 +73,7 @@ dependencies:
       - fastapi
       - uvicorn
       - robosuite==1.4.1
+      - mujoco==3.2.3
       - bddl
       - easydict
       - cloudpickle
@@ -84,7 +85,8 @@ EOF
     conda env create -f /tmp/openvla-oft-environment.yml
     /opt/conda/envs/openvla-oft/bin/pip install --no-deps --force-reinstall \
         protobuf==3.20.3 \
-        tensorflow-metadata==1.14.0
+        tensorflow-metadata==1.14.0 \
+        mujoco==3.2.3
     conda clean -afy
 
     mkdir -p /.venv/bin
