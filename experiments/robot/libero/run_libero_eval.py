@@ -11,6 +11,7 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Union
@@ -243,7 +244,9 @@ def setup_hooks(cfg: GenerateConfig, run_id: str, log_file=None):
 
     writer = None
     if cfg.save_hook_records:
-        output_dir = os.path.join(cfg.hook_output_dir, run_id)
+        output_dir = cfg.hook_output_dir
+        if cfg.hook_output_dir == "./experiments/logs/hooks":
+            output_dir = os.path.join(cfg.hook_output_dir, run_id)
         writer = HookRecordWriter(
             output_dir,
             cfg.hook_config,
@@ -255,6 +258,79 @@ def setup_hooks(cfg: GenerateConfig, run_id: str, log_file=None):
 
     log_message(f"Enabled OpenVLA hooks: {enabled_hooks}", log_file)
     return writer, enabled_hooks, hooks_cfg
+
+
+def write_json(path: Path, data) -> None:
+    """Atomically write JSON metadata in the openpi-inference-recorder layout."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    tmp_path.replace(path)
+
+
+def safe_filename(text: str, max_len: int = 120) -> str:
+    safe = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in text)
+    safe = "_".join(part for part in safe.split("_") if part)
+    return safe[:max_len] or "task"
+
+
+def setup_recording_index(cfg: GenerateConfig, hook_writer, run_id: str, resize_size):
+    """Create openpi-inference-recorder compatible output/index files."""
+    if hook_writer is None:
+        return None
+
+    root_dir = Path(hook_writer.output_dir)
+    output_dir = root_dir / "output"
+    videos_dir = root_dir / "videos"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    videos_dir.mkdir(parents=True, exist_ok=True)
+
+    recording = {
+        "root_dir": root_dir,
+        "output_dir": output_dir,
+        "videos_dir": videos_dir,
+        "episodes_path": output_dir / "episodes.json",
+        "run_summary_path": output_dir / "run_summary.json",
+        "task_summary_path": output_dir / "task_summary.json",
+        "metadata_path": output_dir / "metadata.json",
+        "episode_index": [],
+        "task_summaries": [],
+        "global_episode_num": 0,
+    }
+
+    metadata = {
+        "created_at": datetime.now().isoformat(),
+        "task_suite_name": cfg.task_suite_name,
+        "num_trials_per_task": cfg.num_trials_per_task,
+        "seed": cfg.seed,
+        "resize_size": resize_size,
+        "replan_steps": cfg.num_open_loop_steps,
+        "record_dir": str(root_dir),
+        "output_dir": str(output_dir),
+        "videos_dir": str(videos_dir),
+        "run_id": run_id,
+        "model_family": cfg.model_family,
+        "checkpoint": str(cfg.pretrained_checkpoint),
+    }
+    write_json(recording["metadata_path"], metadata)
+    write_json(recording["episodes_path"], recording["episode_index"])
+    write_json(recording["task_summary_path"], recording["task_summaries"])
+    return recording
+
+
+def make_run_summary(cfg: GenerateConfig, recording, num_tasks: int, total_episodes: int, total_successes: int, hook_writer) -> dict:
+    return {
+        "task_suite_name": cfg.task_suite_name,
+        "num_tasks": int(num_tasks),
+        "num_episodes": int(total_episodes),
+        "num_successes": int(total_successes),
+        "overall_success_rate": float(total_successes / total_episodes) if total_episodes else 0.0,
+        "num_policy_calls": int(hook_writer.counter if hook_writer is not None else 0),
+        "record_dir": str(recording["root_dir"]),
+        "output_dir": str(recording["output_dir"]),
+        "videos_dir": str(recording["videos_dir"]),
+    }
 
 
 def log_message(message: str, log_file=None):
@@ -375,12 +451,12 @@ def run_episode(
             # If action queue is empty, requery model
             if len(action_queue) == 0:
                 record_inputs = {
-                    "full_image": observation["full_image"].copy(),
-                    "state": observation["state"].copy(),
+                    "observation/image": observation["full_image"].copy(),
+                    "observation/state": observation["state"].copy(),
                     "prompt": task_description,
                 }
                 if "wrist_image" in observation:
-                    record_inputs["wrist_image"] = observation["wrist_image"].copy()
+                    record_inputs["observation/wrist_image"] = observation["wrist_image"].copy()
                 hook_context = None
                 if enabled_hooks:
                     hook_context = {
@@ -414,7 +490,7 @@ def run_episode(
                 infer_ms = (time.monotonic() - query_start_time) * 1000
                 if hook_context is not None and hook_writer is not None and hook_context.get("records"):
                     record_outputs = {
-                        "state": record_inputs["state"],
+                        "state": record_inputs["observation/state"],
                         "actions": np.asarray(actions),
                         "policy_timing": {
                             "infer_ms": infer_ms,
@@ -451,7 +527,7 @@ def run_episode(
         for record_path in hook_record_paths:
             hook_writer.update_query_metadata(record_path, {"success": success})
 
-    return success, replay_images
+    return success, replay_images, t
 
 
 def run_task(
@@ -467,6 +543,8 @@ def run_task(
     hook_writer=None,
     enabled_hooks=None,
     hook_cfg=None,
+    recording=None,
+    num_tasks=0,
     total_episodes=0,
     total_successes=0,
     log_file=None,
@@ -483,6 +561,7 @@ def run_task(
 
     # Start episodes
     task_episodes, task_successes = 0, 0
+    task_policy_calls = []
     for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
         log_message(f"\nTask: {task_description}", log_file)
 
@@ -504,9 +583,10 @@ def run_task(
             initial_state = np.array(all_initial_states[initial_states_task_key][episode_key]["initial_state"])
 
         log_message(f"Starting episode {task_episodes + 1}...", log_file)
+        episode_start_idx = hook_writer.counter if hook_writer is not None else 0
 
         # Run episode
-        success, replay_images = run_episode(
+        success, replay_images, num_env_steps = run_episode(
             cfg,
             env,
             task_description,
@@ -524,6 +604,9 @@ def run_task(
             hook_cfg,
             log_file,
         )
+        episode_end_idx = (hook_writer.counter - 1) if hook_writer is not None else episode_start_idx - 1
+        num_policy_calls = max(0, episode_end_idx - episode_start_idx + 1)
+        task_policy_calls.append(num_policy_calls)
 
         # Update counters
         task_episodes += 1
@@ -533,9 +616,44 @@ def run_task(
             total_successes += 1
 
         # Save replay video
-        save_rollout_video(
-            replay_images, total_episodes, success=success, task_description=task_description, log_file=log_file
-        )
+        if recording is not None:
+            suffix = "success" if success else "failure"
+            video_filename = (
+                f"rollout_task{task_id}_episode{episode_idx}_{safe_filename(str(task_description))}_{suffix}.mp4"
+            )
+            save_rollout_video(
+                replay_images,
+                total_episodes,
+                success=success,
+                task_description=task_description,
+                log_file=log_file,
+                output_dir=recording["videos_dir"],
+                filename=video_filename,
+            )
+
+            recording["episode_index"].append(
+                {
+                    "global_episode_num": int(recording["global_episode_num"]),
+                    "episode_num": int(episode_idx),
+                    "task_id": int(task_id),
+                    "task": str(task_description),
+                    "start_idx": int(episode_start_idx),
+                    "end_idx": int(episode_end_idx),
+                    "success": bool(success),
+                    "num_policy_calls": int(num_policy_calls),
+                    "num_env_steps": int(num_env_steps),
+                }
+            )
+            recording["global_episode_num"] += 1
+            write_json(recording["episodes_path"], recording["episode_index"])
+            write_json(
+                recording["run_summary_path"],
+                make_run_summary(cfg, recording, num_tasks, total_episodes, total_successes, hook_writer),
+            )
+        else:
+            save_rollout_video(
+                replay_images, total_episodes, success=success, task_description=task_description, log_file=log_file
+            )
 
         # Log results
         log_message(f"Success: {success}", log_file)
@@ -548,6 +666,20 @@ def run_task(
 
     log_message(f"Current task success rate: {task_success_rate}", log_file)
     log_message(f"Current total success rate: {total_success_rate}", log_file)
+
+    if recording is not None:
+        task_summary = {
+            "task_id": int(task_id),
+            "task": str(task_description),
+            "episodes": int(task_episodes),
+            "successes": int(task_successes),
+            "success_rate": float(task_successes / task_episodes) if task_episodes else 0.0,
+            "mean_policy_calls": float(np.mean(task_policy_calls)) if task_policy_calls else 0.0,
+            "min_policy_calls": int(np.min(task_policy_calls)) if task_policy_calls else 0,
+            "max_policy_calls": int(np.max(task_policy_calls)) if task_policy_calls else 0,
+        }
+        recording["task_summaries"].append(task_summary)
+        write_json(recording["task_summary_path"], recording["task_summaries"])
 
     # Log to wandb if enabled
     if cfg.use_wandb:
@@ -586,6 +718,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[cfg.task_suite_name]()
     num_tasks = task_suite.n_tasks
+    recording = setup_recording_index(cfg, hook_writer, run_id, resize_size)
 
     log_message(f"Task suite: {cfg.task_suite_name}", log_file)
 
@@ -605,6 +738,8 @@ def eval_libero(cfg: GenerateConfig) -> float:
             hook_writer,
             enabled_hooks,
             hook_cfg,
+            recording,
+            num_tasks,
             total_episodes,
             total_successes,
             log_file,
@@ -618,6 +753,14 @@ def eval_libero(cfg: GenerateConfig) -> float:
     log_message(f"Total episodes: {total_episodes}", log_file)
     log_message(f"Total successes: {total_successes}", log_file)
     log_message(f"Overall success rate: {final_success_rate:.4f} ({final_success_rate * 100:.1f}%)", log_file)
+
+    if recording is not None:
+        write_json(recording["episodes_path"], recording["episode_index"])
+        write_json(recording["task_summary_path"], recording["task_summaries"])
+        write_json(
+            recording["run_summary_path"],
+            make_run_summary(cfg, recording, num_tasks, total_episodes, total_successes, hook_writer),
+        )
 
     # Log to wandb if enabled
     if cfg.use_wandb:

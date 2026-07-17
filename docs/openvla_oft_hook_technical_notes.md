@@ -69,9 +69,9 @@ data = np.load("step_0.npy", allow_pickle=True).item()
 The top-level object is a flattened dictionary with `/` separators:
 
 ```text
-inputs/full_image
-inputs/wrist_image
-inputs/state
+inputs/observation/image
+inputs/observation/wrist_image
+inputs/observation/state
 inputs/prompt
 outputs/state
 outputs/actions

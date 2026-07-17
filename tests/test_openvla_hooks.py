@@ -79,7 +79,7 @@ class OpenVLAHookTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             writer = HookRecordWriter(tmpdir, None, {"hooks": {"enabled": ["token_spans"]}})
             path = writer.save_query(
-                inputs={"state": np.zeros(2)},
+                inputs={"observation/state": np.zeros(2)},
                 outputs={"actions": np.zeros((1, 7))},
                 hook_records=[{"hook_name": "token_spans", "data": {}}],
                 metadata={"success": None},
@@ -89,7 +89,7 @@ class OpenVLAHookTests(unittest.TestCase):
             saved = np.load(Path(path), allow_pickle=True).item()
             self.assertEqual(Path(path).name, "step_0.npy")
             self.assertTrue((Path(tmpdir) / "output" / "hook_manifest.json").exists())
-            self.assertIn("inputs/state", saved)
+            self.assertIn("inputs/observation/state", saved)
             self.assertIn("outputs/actions", saved)
             self.assertIn("hook_records", saved)
             self.assertTrue(saved["outputs/metadata/success"])

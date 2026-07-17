@@ -59,5 +59,7 @@ file and installs dependencies. Source code is mounted at runtime with `-B`.
 - Use `--nv` for NVIDIA GPU passthrough.
 - Bind a persistent Hugging Face cache, or every job may redownload checkpoints.
 - `MUJOCO_GL=egl` and `PYOPENGL_PLATFORM=egl` are set for headless cluster runs.
+- The image also creates `/.venv/bin/python` as an alias to the conda Python so
+  `openpi-inference-recorder` can use its hardcoded direct-OpenVLA command.
 - Flash Attention is not installed here; the hook path needs returned attention
   tensors, and optimized attention kernels often do not expose them.

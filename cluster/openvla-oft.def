@@ -83,6 +83,9 @@ EOF
     conda env create -f /tmp/openvla-oft-environment.yml
     conda clean -afy
 
+    mkdir -p /.venv/bin
+    ln -sf /opt/conda/envs/openvla-oft/bin/python /.venv/bin/python
+
 %environment
     export PATH=/opt/conda/envs/openvla-oft/bin:/opt/conda/bin:$PATH
     export CONDA_DEFAULT_ENV=openvla-oft
