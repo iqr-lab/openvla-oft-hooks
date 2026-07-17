@@ -684,7 +684,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         )
         actions_hidden_states = language_model_output.hidden_states[-1][:, action_start:action_end, :]
         normalized_actions = action_head.predict_action(actions_hidden_states)
-        score = normalized_actions[:, 0, :].sum()
+        score = normalized_actions.sum()
         return torch.autograd.grad(score, prefix, retain_graph=False, create_graph=False)[0]
 
     def _build_hook_payload(

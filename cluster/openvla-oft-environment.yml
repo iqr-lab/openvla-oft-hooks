@@ -1,0 +1,43 @@
+name: openvla-oft
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - git
+  - pip:
+      - accelerate>=0.25.0
+      - draccus==0.8.0
+      - einops
+      - huggingface_hub
+      - imageio
+      - imageio[ffmpeg]
+      - json-numpy
+      - jsonlines
+      - matplotlib
+      - numpy<2
+      - peft==0.11.1
+      - protobuf
+      - pyyaml
+      - rich
+      - sentencepiece==0.1.99
+      - timm==0.9.10
+      - tokenizers==0.19.1
+      - torch==2.2.0
+      - torchvision==0.17.0
+      - torchaudio==2.2.0
+      - git+https://github.com/moojink/transformers-openvla-oft.git
+      - wandb
+      - tensorflow==2.15.0
+      - tensorflow_datasets==4.9.3
+      - tensorflow_graphics==2021.12.3
+      - git+https://github.com/moojink/dlimp_openvla
+      - diffusers==0.30.3
+      - fastapi
+      - uvicorn
+      - robosuite==1.4.1
+      - bddl
+      - easydict
+      - cloudpickle
+      - gym
+      - git+https://github.com/Lifelong-Robot-Learning/LIBERO.git
