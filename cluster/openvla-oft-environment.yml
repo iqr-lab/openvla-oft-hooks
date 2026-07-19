@@ -27,6 +27,7 @@ dependencies:
       - torchvision==0.17.0
       - torchaudio==2.2.0
       - git+https://github.com/moojink/transformers-openvla-oft.git
+      - Wand==0.6.13
       - wandb
       - tensorflow==2.15.0
       - tensorflow_datasets==4.9.3
