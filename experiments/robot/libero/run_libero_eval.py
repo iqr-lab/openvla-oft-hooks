@@ -114,6 +114,7 @@ class GenerateConfig:
     task_suite_name: str = TaskSuite.LIBERO_SPATIAL  # Task suite
     num_steps_wait: int = 10                         # Number of steps to wait for objects to stabilize in sim
     num_trials_per_task: int = 50                    # Number of rollouts per task
+    exclude_language_variations: bool = False        # For LIBERO-Plus, skip *_language_* / Language Instructions tasks
     initial_states_path: str = "DEFAULT"             # "DEFAULT", or path to initial states JSON file
     env_img_res: int = 256                           # Resolution for environment images (not policy input resolution)
 
@@ -333,6 +334,28 @@ def make_run_summary(cfg: GenerateConfig, recording, num_tasks: int, total_episo
     }
 
 
+def load_task_classification() -> dict:
+    path = Path(benchmark.__file__).parent / "task_classification.json"
+    if not path.exists():
+        return {}
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def language_variation_task_names(task_suite_name: str) -> set[str]:
+    classification = load_task_classification().get(task_suite_name, [])
+    return {
+        entry["name"]
+        for entry in classification
+        if "_language_" in entry["name"]
+        or entry.get("category", "").strip().lower() == "language instructions"
+    }
+
+
+def is_language_variation(task, language_variation_names: set[str]) -> bool:
+    return task.name in language_variation_names or "_language_" in task.name
+
+
 def log_message(message: str, log_file=None):
     """Log a message to console and optionally to a log file."""
     logger.info(message)
@@ -488,7 +511,14 @@ def run_episode(
                     hook_context=hook_context,
                 )
                 infer_ms = (time.monotonic() - query_start_time) * 1000
-                if hook_context is not None and hook_writer is not None and hook_context.get("records"):
+                if hook_context is not None and hook_writer is not None:
+                    hook_records = hook_context.get("records", [])
+                    if not hook_records and query_idx == 0:
+                        log_message(
+                            "OpenVLA hooks were enabled, but the model produced no hook records for this episode. "
+                            "Saving the policy query with an empty hook_records list.",
+                            log_file,
+                        )
                     record_outputs = {
                         "state": record_inputs["observation/state"],
                         "actions": np.asarray(actions),
@@ -499,7 +529,7 @@ def run_episode(
                     record_path = hook_writer.save_query(
                         inputs=record_inputs,
                         outputs=record_outputs,
-                        hook_records=hook_context["records"],
+                        hook_records=hook_records,
                         metadata=hook_context["metadata"],
                     )
                     hook_record_paths.append(record_path)
@@ -724,7 +754,20 @@ def eval_libero(cfg: GenerateConfig) -> float:
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
+    language_variation_names = language_variation_task_names(cfg.task_suite_name)
+    if cfg.exclude_language_variations:
+        n_excluded = sum(
+            1
+            for task_id in range(num_tasks)
+            if is_language_variation(task_suite.get_task(task_id), language_variation_names)
+        )
+        log_message(f"Excluding {n_excluded} LIBERO-Plus language-variation tasks.", log_file)
+
     for task_id in tqdm.tqdm(range(num_tasks)):
+        task = task_suite.get_task(task_id)
+        if cfg.exclude_language_variations and is_language_variation(task, language_variation_names):
+            continue
+
         total_episodes, total_successes = run_task(
             cfg,
             task_suite,
