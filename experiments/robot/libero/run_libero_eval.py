@@ -26,10 +26,12 @@ import wandb
 # Append current directory so that interpreter can find experiments.robot
 sys.path.append("../..")
 from experiments.robot.libero.libero_utils import (
+    base_task_name,
     get_libero_dummy_action,
     get_libero_env,
     get_libero_image,
     get_libero_wrist_image,
+    is_language_variation_name,
     quat2axisangle,
     save_rollout_video,
 )
@@ -114,6 +116,7 @@ class GenerateConfig:
     task_suite_name: str = TaskSuite.LIBERO_SPATIAL  # Task suite
     num_steps_wait: int = 10                         # Number of steps to wait for objects to stabilize in sim
     num_trials_per_task: int = 50                    # Number of rollouts per task
+    max_episodes: Optional[int] = None               # If set, select this many episodes total, balanced across LIBERO-Plus metadata
     exclude_language_variations: bool = False        # For LIBERO-Plus, skip *_language_* / Language Instructions tasks
     initial_states_path: str = "DEFAULT"             # "DEFAULT", or path to initial states JSON file
     env_img_res: int = 256                           # Resolution for environment images (not policy input resolution)
@@ -126,6 +129,8 @@ class GenerateConfig:
     hook_config: Optional[str] = None                # Optional YAML config enabling OpenVLA hook capture
     hook_output_dir: str = "./experiments/logs/hooks" # Root directory for hook .npy records
     save_hook_records: bool = True                   # Whether to persist enabled hook records
+    resume_from_json: Optional[str] = None           # Path to previous episode_summaries.json / episodes.json; completed episodes are skipped
+    checkpoint_interval: int = 50                    # Write episode-summary checkpoints every N completed episodes
 
     use_wandb: bool = False                          # Whether to also log results in Weights & Biases
     wandb_entity: str = "your-wandb-entity"          # Name of WandB entity
@@ -147,6 +152,9 @@ def validate_config(cfg: GenerateConfig) -> None:
 
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
+    if cfg.max_episodes is not None:
+        assert cfg.max_episodes >= 0, "max_episodes must be non-negative!"
+    assert cfg.checkpoint_interval >= 0, "checkpoint_interval must be non-negative!"
 
 
 def initialize_model(cfg: GenerateConfig):
@@ -276,11 +284,12 @@ def safe_filename(text: str, max_len: int = 120) -> str:
     return safe[:max_len] or "task"
 
 
-def setup_recording_index(cfg: GenerateConfig, hook_writer, run_id: str, resize_size):
+def setup_recording_index(cfg: GenerateConfig, hook_writer, run_id: str, resize_size, episode_summaries=None):
     """Create openpi-inference-recorder compatible output/index files."""
     if hook_writer is None:
         return None
 
+    episode_summaries = list(episode_summaries or [])
     root_dir = Path(hook_writer.output_dir)
     output_dir = root_dir / "output"
     videos_dir = root_dir / "videos"
@@ -292,18 +301,22 @@ def setup_recording_index(cfg: GenerateConfig, hook_writer, run_id: str, resize_
         "output_dir": output_dir,
         "videos_dir": videos_dir,
         "episodes_path": output_dir / "episodes.json",
+        "episode_summaries_path": output_dir / "episode_summaries.json",
         "run_summary_path": output_dir / "run_summary.json",
         "task_summary_path": output_dir / "task_summary.json",
         "metadata_path": output_dir / "metadata.json",
-        "episode_index": [],
+        "episode_index": episode_summaries,
         "task_summaries": [],
-        "global_episode_num": 0,
+        "global_episode_num": len(episode_summaries),
     }
 
     metadata = {
         "created_at": datetime.now().isoformat(),
         "task_suite_name": cfg.task_suite_name,
         "num_trials_per_task": cfg.num_trials_per_task,
+        "max_episodes": cfg.max_episodes,
+        "exclude_language_variations": cfg.exclude_language_variations,
+        "resume_from_json": cfg.resume_from_json,
         "seed": cfg.seed,
         "resize_size": resize_size,
         "replan_steps": cfg.num_open_loop_steps,
@@ -315,7 +328,7 @@ def setup_recording_index(cfg: GenerateConfig, hook_writer, run_id: str, resize_
         "checkpoint": str(cfg.pretrained_checkpoint),
     }
     write_json(recording["metadata_path"], metadata)
-    write_json(recording["episodes_path"], recording["episode_index"])
+    write_episode_summaries(recording)
     write_json(recording["task_summary_path"], recording["task_summaries"])
     return recording
 
@@ -328,9 +341,13 @@ def make_run_summary(cfg: GenerateConfig, recording, num_tasks: int, total_episo
         "num_successes": int(total_successes),
         "overall_success_rate": float(total_successes / total_episodes) if total_episodes else 0.0,
         "num_policy_calls": int(hook_writer.counter if hook_writer is not None else 0),
+        "max_episodes": cfg.max_episodes,
+        "exclude_language_variations": cfg.exclude_language_variations,
+        "resume_from_json": cfg.resume_from_json,
         "record_dir": str(recording["root_dir"]),
         "output_dir": str(recording["output_dir"]),
         "videos_dir": str(recording["videos_dir"]),
+        "episode_summaries_path": str(recording["episode_summaries_path"]),
     }
 
 
@@ -342,18 +359,100 @@ def load_task_classification() -> dict:
         return json.load(f)
 
 
-def language_variation_task_names(task_suite_name: str) -> set[str]:
+def get_task_metadata(task_suite, task_suite_name: str) -> list[dict]:
     classification = load_task_classification().get(task_suite_name, [])
-    return {
-        entry["name"]
-        for entry in classification
-        if "_language_" in entry["name"]
-        or entry.get("category", "").strip().lower() == "language instructions"
-    }
+    by_name = {entry["name"]: entry for entry in classification}
+    metadata = []
+    for task_id in range(task_suite.n_tasks):
+        task = task_suite.get_task(task_id)
+        entry = by_name.get(task.name)
+        if entry is None:
+            metadata.append(
+                {
+                    "name": task.name,
+                    "base": base_task_name(task.name),
+                    "category": "default",
+                    "difficulty": 0,
+                    "is_language_variation": is_language_variation_name(task.name),
+                }
+            )
+        else:
+            category = entry.get("category", "default")
+            metadata.append(
+                {
+                    "name": entry["name"],
+                    "base": base_task_name(entry["name"]),
+                    "category": category,
+                    "difficulty": entry.get("difficulty_level", 0),
+                    "is_language_variation": is_language_variation_name(entry["name"], category),
+                }
+            )
+    return metadata
 
 
-def is_language_variation(task, language_variation_names: set[str]) -> bool:
-    return task.name in language_variation_names or "_language_" in task.name
+def select_episode_counts(metadata: list[dict], max_episodes: int, capacity: int, seed: int) -> np.ndarray:
+    """Distribute an episode budget across task, category, and difficulty buckets."""
+    n_tasks = len(metadata)
+    if n_tasks == 0 or max_episodes <= 0 or capacity <= 0:
+        return np.zeros(n_tasks, dtype=int)
+
+    bases = sorted({m["base"] for m in metadata})
+    categories = sorted({m["category"] for m in metadata})
+    difficulties = sorted({m["difficulty"] for m in metadata})
+
+    base_ids = np.array([bases.index(m["base"]) for m in metadata])
+    category_ids = np.array([categories.index(m["category"]) for m in metadata])
+    difficulty_ids = np.array([difficulties.index(m["difficulty"]) for m in metadata])
+
+    base_count = np.zeros(len(bases))
+    category_count = np.zeros(len(categories))
+    difficulty_count = np.zeros(len(difficulties))
+
+    remaining = np.full(n_tasks, capacity, dtype=int)
+    counts = np.zeros(n_tasks, dtype=int)
+
+    rng = np.random.default_rng(seed)
+    jitter = rng.random(n_tasks) * 1e-6
+    n_select = min(max_episodes, int(remaining.sum()))
+    for _ in range(n_select):
+        score = (
+            base_count[base_ids] / len(bases)
+            + category_count[category_ids] / len(categories)
+            + difficulty_count[difficulty_ids] / len(difficulties)
+            + jitter
+        )
+        score = np.where(remaining > 0, score, np.inf)
+        best = int(np.argmin(score))
+
+        counts[best] += 1
+        remaining[best] -= 1
+        base_count[base_ids[best]] += 1
+        category_count[category_ids[best]] += 1
+        difficulty_count[difficulty_ids[best]] += 1
+
+    return counts
+
+
+def load_resume_episode_summaries(path: str | None, log_file=None) -> list[dict]:
+    if path is None:
+        return []
+    with open(path, encoding="utf-8") as f:
+        summaries = json.load(f)
+    log_message(f"Skipping {len(summaries)} episodes already in {path}.", log_file)
+    return list(summaries)
+
+
+def completed_episode_keys(episode_summaries: list[dict]) -> set[tuple[int, int]]:
+    return {(int(summary["task_id"]), int(summary["episode_num"])) for summary in episode_summaries}
+
+
+def next_record_index(episode_summaries: list[dict]) -> int:
+    return max([int(summary.get("end_idx", -1)) for summary in episode_summaries] + [-1]) + 1
+
+
+def write_episode_summaries(recording) -> None:
+    write_json(recording["episodes_path"], recording["episode_index"])
+    write_json(recording["episode_summaries_path"], recording["episode_index"])
 
 
 def log_message(message: str, log_file=None):
@@ -575,6 +674,8 @@ def run_task(
     hook_cfg=None,
     recording=None,
     num_tasks=0,
+    episode_count=None,
+    completed_keys=None,
     total_episodes=0,
     total_successes=0,
     log_file=None,
@@ -587,12 +688,23 @@ def run_task(
     initial_states, all_initial_states = load_initial_states(cfg, task_suite, task_id, log_file)
 
     # Initialize environment and get task description
-    env, task_description = get_libero_env(task, cfg.model_family, resolution=cfg.env_img_res)
+    env, task_description = get_libero_env(task, cfg.model_family, resolution=cfg.env_img_res, seed=cfg.seed)
+
+    episode_count = cfg.num_trials_per_task if episode_count is None else int(episode_count)
+    n_available = len(initial_states)
+    if episode_count <= 0 or n_available == 0:
+        return total_episodes, total_successes
+    episode_indices = np.linspace(0, n_available - 1, min(episode_count, n_available), dtype=int)
+    completed_keys = completed_keys or set()
 
     # Start episodes
     task_episodes, task_successes = 0, 0
     task_policy_calls = []
-    for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
+    for episode_idx in tqdm.tqdm(episode_indices):
+        episode_idx = int(episode_idx)
+        if (int(task_id), episode_idx) in completed_keys:
+            continue
+
         log_message(f"\nTask: {task_description}", log_file)
 
         # Handle initial state
@@ -675,7 +787,7 @@ def run_task(
                 }
             )
             recording["global_episode_num"] += 1
-            write_json(recording["episodes_path"], recording["episode_index"])
+            write_episode_summaries(recording)
             write_json(
                 recording["run_summary_path"],
                 make_run_summary(cfg, recording, num_tasks, total_episodes, total_successes, hook_writer),
@@ -689,6 +801,13 @@ def run_task(
         log_message(f"Success: {success}", log_file)
         log_message(f"# episodes completed so far: {total_episodes}", log_file)
         log_message(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)", log_file)
+        if recording is not None and cfg.checkpoint_interval > 0 and total_episodes % cfg.checkpoint_interval == 0:
+            write_episode_summaries(recording)
+            write_json(
+                recording["run_summary_path"],
+                make_run_summary(cfg, recording, num_tasks, total_episodes, total_successes, hook_writer),
+            )
+            log_message(f"Checkpointed episode summaries after {total_episodes} episodes.", log_file)
 
     # Log task results
     task_success_rate = float(task_successes) / float(task_episodes) if task_episodes > 0 else 0
@@ -697,7 +816,7 @@ def run_task(
     log_message(f"Current task success rate: {task_success_rate}", log_file)
     log_message(f"Current total success rate: {total_success_rate}", log_file)
 
-    if recording is not None:
+    if recording is not None and task_episodes > 0:
         task_summary = {
             "task_id": int(task_id),
             "task": str(task_description),
@@ -741,31 +860,58 @@ def eval_libero(cfg: GenerateConfig) -> float:
     # Setup logging
     log_file, local_log_filepath, run_id = setup_logging(cfg)
 
+    # Load resume state before constructing the recording index.
+    resume_episode_summaries = load_resume_episode_summaries(cfg.resume_from_json, log_file)
+    completed_keys = completed_episode_keys(resume_episode_summaries)
+    resume_next_idx = next_record_index(resume_episode_summaries)
+
     # Configure optional OpenVLA hook capture
     hook_writer, enabled_hooks, hook_cfg = setup_hooks(cfg, run_id, log_file)
+    if hook_writer is not None and resume_next_idx > hook_writer.counter:
+        hook_writer.counter = resume_next_idx
+        log_message(f"Resuming hook record numbering at step_{hook_writer.counter}.npy.", log_file)
 
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[cfg.task_suite_name]()
     num_tasks = task_suite.n_tasks
-    recording = setup_recording_index(cfg, hook_writer, run_id, resize_size)
+    recording = setup_recording_index(
+        cfg,
+        hook_writer,
+        run_id,
+        resize_size,
+        episode_summaries=resume_episode_summaries,
+    )
 
     log_message(f"Task suite: {cfg.task_suite_name}", log_file)
 
     # Start evaluation
-    total_episodes, total_successes = 0, 0
-    language_variation_names = language_variation_task_names(cfg.task_suite_name)
+    total_episodes = len(resume_episode_summaries)
+    total_successes = sum(1 for summary in resume_episode_summaries if summary.get("success", False))
+    task_metadata = get_task_metadata(task_suite, cfg.task_suite_name)
+    eligible_task_ids = [
+        task_id
+        for task_id, metadata in enumerate(task_metadata)
+        if not (cfg.exclude_language_variations and metadata["is_language_variation"])
+    ]
     if cfg.exclude_language_variations:
-        n_excluded = sum(
-            1
-            for task_id in range(num_tasks)
-            if is_language_variation(task_suite.get_task(task_id), language_variation_names)
-        )
+        n_excluded = num_tasks - len(eligible_task_ids)
         log_message(f"Excluding {n_excluded} LIBERO-Plus language-variation tasks.", log_file)
 
+    episode_counts = np.zeros(num_tasks, dtype=int)
+    if cfg.max_episodes is not None:
+        selected_counts = select_episode_counts(
+            [task_metadata[task_id] for task_id in eligible_task_ids],
+            cfg.max_episodes,
+            cfg.num_trials_per_task,
+            cfg.seed,
+        )
+        episode_counts[np.asarray(eligible_task_ids, dtype=int)] = selected_counts
+    else:
+        episode_counts[np.asarray(eligible_task_ids, dtype=int)] = cfg.num_trials_per_task
+
     for task_id in tqdm.tqdm(range(num_tasks)):
-        task = task_suite.get_task(task_id)
-        if cfg.exclude_language_variations and is_language_variation(task, language_variation_names):
+        if episode_counts[task_id] == 0:
             continue
 
         total_episodes, total_successes = run_task(
@@ -783,6 +929,8 @@ def eval_libero(cfg: GenerateConfig) -> float:
             hook_cfg,
             recording,
             num_tasks,
+            episode_counts[task_id],
+            completed_keys,
             total_episodes,
             total_successes,
             log_file,
@@ -798,7 +946,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
     log_message(f"Overall success rate: {final_success_rate:.4f} ({final_success_rate * 100:.1f}%)", log_file)
 
     if recording is not None:
-        write_json(recording["episodes_path"], recording["episode_index"])
+        write_episode_summaries(recording)
         write_json(recording["task_summary_path"], recording["task_summaries"])
         write_json(
             recording["run_summary_path"],
