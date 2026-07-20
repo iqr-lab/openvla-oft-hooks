@@ -58,6 +58,7 @@ dependencies:
       - protobuf==3.20.3
       - pyyaml
       - rich
+      - scikit-image==0.22.0
       - sentencepiece==0.1.99
       - timm==0.9.10
       - tokenizers==0.19.1
@@ -94,10 +95,12 @@ EOF
 from google.protobuf import __version__ as protobuf_version
 from tensorflow_metadata.proto.v0 import schema_pb2
 import mujoco
+from skimage.filters import gaussian
 from wand.api import library as wandlibrary
 
 print(f"Verified protobuf/tensorflow-metadata import with protobuf {protobuf_version}")
 print(f"Verified mujoco {mujoco.__version__}")
+print("Verified scikit-image import")
 print("Verified Wand/ImageMagick import")
 PY
     conda clean -afy

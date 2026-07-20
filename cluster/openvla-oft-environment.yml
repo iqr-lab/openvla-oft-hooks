@@ -20,6 +20,7 @@ dependencies:
       - protobuf==3.20.3
       - pyyaml
       - rich
+      - scikit-image==0.22.0
       - sentencepiece==0.1.99
       - timm==0.9.10
       - tokenizers==0.19.1
