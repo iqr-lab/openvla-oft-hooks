@@ -6,6 +6,7 @@ import numpy as np
 import torch
 
 from experiments.robot.openvla_hooks.hook_runner import emit_all, set_enabled_hooks, set_hook_config
+from experiments.robot.openvla_hooks import record_io
 from experiments.robot.openvla_hooks.io import HookRecordWriter
 from experiments.robot.openvla_hooks.runtime import collect_hook_records
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
@@ -85,15 +86,60 @@ class OpenVLAHookTests(unittest.TestCase):
                 metadata={"success": None},
             )
             writer.update_query_metadata(path, {"success": True})
+            writer.close()
 
-            saved = np.load(Path(path), allow_pickle=True).item()
-            self.assertEqual(Path(path).name, "step_0.npy")
+            saved = record_io.load_record(Path(path))
+            self.assertEqual(Path(path).name, f"step_0{writer.suffix}")
             self.assertTrue((Path(tmpdir) / "output" / "hook_manifest.json").exists())
             self.assertIn("inputs/observation/state", saved)
             self.assertIn("outputs/actions", saved)
             self.assertIn("hook_records", saved)
             self.assertTrue(saved["outputs/metadata/success"])
             self.assertTrue(saved["hook_records"][0]["metadata"]["success"])
+
+
+    def test_writer_legacy_npy(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer = HookRecordWriter(
+                tmpdir,
+                None,
+                {"hooks": {"enabled": []}, "record": {"compress": False}},
+            )
+            path = writer.save_query(
+                inputs={"observation/state": np.zeros(2)},
+                outputs={"actions": np.zeros((1, 7))},
+                hook_records=[],
+                metadata={"success": None},
+            )
+            writer.update_query_metadata(path, {"success": True})
+            writer.close()
+
+            self.assertEqual(Path(path).name, "step_0.npy")
+            saved = record_io.load_record(Path(path))
+            self.assertTrue(saved["outputs/metadata/success"])
+
+    def test_writer_parallel_workers_keep_order(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            writer = HookRecordWriter(
+                tmpdir,
+                None,
+                {"hooks": {"enabled": []}, "record": {"writer_threads": 4}},
+            )
+            for i in range(12):
+                writer.save_query(
+                    inputs={"marker": np.asarray(i)},
+                    outputs={"actions": np.zeros((1, 7))},
+                    hook_records=[],
+                )
+            writer.close()
+
+            paths = sorted(
+                Path(tmpdir).glob(f"step_*{writer.suffix}"),
+                key=lambda p: int(p.stem.split("_")[1]),
+            )
+            self.assertEqual(len(paths), 12)
+            markers = [int(np.asarray(record_io.load_record(p)["inputs/marker"])) for p in paths]
+            self.assertEqual(markers, list(range(12)))
 
 
 if __name__ == "__main__":

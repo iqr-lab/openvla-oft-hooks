@@ -127,7 +127,7 @@ class GenerateConfig:
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     local_log_dir: str = "./experiments/logs"        # Local directory for eval logs
     hook_config: Optional[str] = None                # Optional YAML config enabling OpenVLA hook capture
-    hook_output_dir: str = "./experiments/logs/hooks" # Root directory for hook .npy records
+    hook_output_dir: str = "./experiments/logs/hooks" # Root directory for hook step_* records
     save_hook_records: bool = True                   # Whether to persist enabled hook records
     resume_from_json: Optional[str] = None           # Path to previous episode_summaries.json / episodes.json; completed episodes are skipped
     checkpoint_interval: int = 50                    # Write episode-summary checkpoints every N completed episodes
@@ -869,7 +869,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
     hook_writer, enabled_hooks, hook_cfg = setup_hooks(cfg, run_id, log_file)
     if hook_writer is not None and resume_next_idx > hook_writer.counter:
         hook_writer.counter = resume_next_idx
-        log_message(f"Resuming hook record numbering at step_{hook_writer.counter}.npy.", log_file)
+        log_message(f"Resuming hook record numbering at step_{hook_writer.counter}{hook_writer.suffix}.", log_file)
 
     # Initialize LIBERO task suite
     benchmark_dict = benchmark.get_benchmark_dict()
